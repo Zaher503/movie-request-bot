@@ -25,7 +25,7 @@ Add these actions in order by searching for the exact action names:
 
 2. **Match Text**
    * Search for "Match Text".
-   * Pattern: `(?i)^\s*#\s*(movie:.*|\d{1,2}|more|cancel|undo)\s*$`
+   * Pattern: `(?i)^\s*!\s*(movie:.*|show:.*|\d{1,2}|more|cancel|undo|all|s(eason)?\s*\d{1,2})\s*$`
    * Text: the Text from step 1.
 
 3. **If**
@@ -84,7 +84,7 @@ Add these actions in order by searching for the exact action names:
 ## Testing & Troubleshooting
 
 To test the automation:
-1. Have your wife (or another Apple ID temporarily set as the sender in the automation) text you: `#movie: Scream`
+1. Have your wife (or another Apple ID temporarily set as the sender in the automation) text you: `!movie: Scream` (or `!show: Severance`)
 2. Test this while your phone is locked to ensure background execution works correctly.
 
 **If nothing happens:**
@@ -96,19 +96,22 @@ To test the automation:
 curl -s -X POST https://zaher.site/movie/message \
   -H "X-Movie-Key: <SECRET>" \
   -H "Content-Type: application/json" \
-  -d '{"sender":"wife","text":"#movie: Scream"}'
+  -d '{"sender":"wife","text":"!movie: Scream"}'
 ```
 
 ---
 
 ## Cheat Sheet
 
-You can text this to your wife to show her how to use the bot. Every command needs a `#` in front, so normal texts never trigger it:
+You can text this to your wife to show her how to use the bot. Every command needs a `!` in front, so normal texts never trigger it:
 
-* **#movie: <title>** - Search for a movie (e.g. `#movie: Scream`)
-* **#1**, **#2**, or **#3** - Pick a movie from the search results
-* **#more** - See more search results
-* **#cancel** - Cancel the current search
-* **#undo** - Undo a movie request (within 3 minutes)
+* **!movie: <title>** - Search for a movie (e.g. `!movie: Scream`)
+* **!show: <title>** - Search for a TV show (e.g. `!show: Severance`); results list how many seasons each has
+* **!1**, **!2**, **!3** - Pick a movie or show from the search results
+* **!all** - After picking a show, download every season you don't already have
+* **!season N** (or **!sN**) - After picking a show, download just that season (e.g. `!s2`)
+* **!more** - See more search results
+* **!cancel** - Cancel the current search
+* **!undo** - Undo the last request (within 3 minutes)
 
-*(Note: There is a limit of 2 requests per day, and search results expire after 15 minutes.)*
+*(Note: There is a daily request limit (a show request counts as one), and search results expire after 15 minutes.)*

@@ -6,7 +6,7 @@ from PIL import Image, ImageDraw, ImageFont
 def build_grid(items: list[dict], out_path: str) -> None:
     padding = 16
     poster_w, poster_h = 342, 513
-    label_h = 60
+    label_h = 84 if any(item.get("subtitle") for item in items) else 60
     tile_w = poster_w
     tile_h = poster_h + label_h
     
@@ -126,12 +126,16 @@ def build_grid(items: list[dict], out_path: str) -> None:
         sub_y = ly + 14
         draw.text((sub_x, sub_y), sub_text, fill="#aaa", font=font_small)
 
+        subtitle = item.get("subtitle")
+        if subtitle:
+            draw.text((x, ly + 48), subtitle, fill="#fff", font=font_med_bold)
+
     img.convert("RGB").save(out_path, "JPEG", quality=85)
 
 if __name__ == "__main__":
     fake_items = [
         {"n": 1, "poster_url": None, "title": "Scream", "year": "1996", "badge": "In Library"},
         {"n": 2, "poster_url": None, "title": "Scream 2", "year": "1997", "badge": "Requested"},
-        {"n": 3, "poster_url": None, "title": "Scream 3", "year": "2000", "badge": None},
+        {"n": 3, "poster_url": None, "title": "Scream 3", "year": "2000", "badge": None, "subtitle": "3 seasons"},
     ]
     build_grid(fake_items, "sample.jpg")

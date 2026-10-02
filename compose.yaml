@@ -11,6 +11,7 @@ services:
     environment:
       SEERR_URL: http://media-jellyseerr:5055
       RADARR_URL: http://media-radarr:7878
+      SONARR_URL: http://media-sonarr:8989
       PUBLIC_BASE: https://zaher.site
       TZ: America/Los_Angeles
       DAILY_LIMIT: "5"

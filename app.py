@@ -8,6 +8,7 @@ import sqlite3
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -30,6 +31,8 @@ SEERR_URL = setting("SEERR_URL", "http://jellyseerr:5055").rstrip("/")
 SEERR_API_KEY = setting("SEERR_API_KEY", required=True)
 RADARR_URL = setting("RADARR_URL", "http://radarr:7878").rstrip("/")
 RADARR_API_KEY = setting("RADARR_API_KEY", required=True)
+SONARR_URL = setting("SONARR_URL", "http://sonarr:8989").rstrip("/")
+SONARR_API_KEY = setting("SONARR_API_KEY")  # optional: lets !undo remove a show from Sonarr/qBit
 SHARED_SECRET = setting("SHARED_SECRET", required=True)
 PUBLIC_BASE = setting("PUBLIC_BASE", "https://zaher.site").rstrip("/")
 DATA_DIR = Path(setting("DATA_DIR", "/data"))
@@ -51,6 +54,8 @@ message_lock = threading.Lock()
 SENDER_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 TOKEN_RE = re.compile(r"^[a-f0-9]{32}$")
 MOVIE_RE = re.compile(r"^movie:\s*(.*)$", re.IGNORECASE | re.DOTALL)
+SHOW_RE = re.compile(r"^show:\s*(.*)$", re.IGNORECASE | re.DOTALL)
+SEASON_RE = re.compile(r"^(?:season\s*|s)(\d{1,2})$", re.IGNORECASE)
 PICK_RE = re.compile(r"^(\d{1,2})$")
 
 
@@ -76,6 +81,18 @@ def init_db():
                 undone INTEGER NOT NULL DEFAULT 0
             )
         """)
+        # Show support: columns added after the first release, so migrate in place.
+        # For shows, radarr_preexisting means "Seerr already knew this show".
+        for ddl in (
+            "ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'movie'",
+            "ALTER TABLE sessions ADD COLUMN pending_json TEXT",
+            "ALTER TABLE requests ADD COLUMN media_type TEXT NOT NULL DEFAULT 'movie'",
+            "ALTER TABLE requests ADD COLUMN seasons TEXT",
+        ):
+            try:
+                conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
 
 init_db()
@@ -93,6 +110,10 @@ def seerr_headers():
 
 def radarr_headers():
     return {"X-Api-Key": RADARR_API_KEY}
+
+
+def sonarr_headers():
+    return {"X-Api-Key": SONARR_API_KEY}
 
 
 def seerr_search(query, page):
@@ -138,6 +159,64 @@ def movie_from_result(result):
     }
 
 
+def show_from_result(result):
+    media_info = result.get("mediaInfo") or {}
+    return {
+        "tmdb_id": result.get("id"),
+        "title": str(result.get("name") or "Unknown title"),
+        "year": str(result.get("firstAirDate") or "?")[:4] or "?",
+        "rating": result.get("voteAverage") or 0,
+        "vote_count": result.get("voteCount") or 0,
+        "poster_path": result.get("posterPath"),
+        "status": media_info.get("status"),
+        "media_id": media_info.get("id"),
+    }
+
+
+def seerr_get_tv(tmdb_id):
+    try:
+        response = requests.get(
+            f"{SEERR_URL}/api/v1/tv/{tmdb_id}", headers=seerr_headers(), timeout=15,
+        )
+        if not response.ok:
+            log.warning("Seerr tv lookup failed: %s %s", response.status_code, response.text[:300])
+            return None
+        return response.json()
+    except (requests.RequestException, ValueError):
+        log.warning("Seerr tv lookup failed for tmdb_id=%s", tmdb_id)
+        return None
+
+
+def season_info(details):
+    """(all real season numbers, the ones not already in the library or requested)"""
+    media_info = details.get("mediaInfo") or {}
+    taken = {s.get("seasonNumber") for s in media_info.get("seasons") or []
+             if s.get("status") in (2, 3, 4, 5)}
+    numbers = sorted(s["seasonNumber"] for s in details.get("seasons") or []
+                     if (s.get("seasonNumber") or 0) > 0)
+    return numbers, [n for n in numbers if n not in taken]
+
+
+def enrich_shows(batch):
+    def load(show):
+        details = seerr_get_tv(show["tmdb_id"])
+        if details is None:
+            return
+        numbers, requestable = season_info(details)
+        show["season_count"] = len(numbers) or int(details.get("numberOfSeasons") or 0)
+        show["requestable"] = requestable
+        show["status"] = (details.get("mediaInfo") or {}).get("status", show.get("status"))
+    with ThreadPoolExecutor(max_workers=len(batch)) as pool:
+        list(pool.map(load, batch))
+
+
+def season_label(show):
+    count = show.get("season_count")
+    if count is None:
+        return "? seasons"
+    return f"{count} season{'' if count == 1 else 's'}"
+
+
 def status_badge(status):
     if status == 5:
         return "✅ in library"
@@ -157,20 +236,25 @@ def get_live_session(conn, sender, now):
         return None
     session = dict(row)
     session["results"] = json.loads(session.pop("results_json"))
+    pending = session.pop("pending_json")
+    session["pending"] = json.loads(pending) if pending else None
     return session
 
 
 def save_session(conn, sender, session):
     conn.execute("""
-        INSERT INTO sessions (sender, query, results_json, next_page, total_pages, shown, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO sessions (sender, query, results_json, next_page, total_pages, shown, updated_at,
+                              kind, pending_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(sender) DO UPDATE SET
           query=excluded.query, results_json=excluded.results_json,
           next_page=excluded.next_page, total_pages=excluded.total_pages,
-          shown=excluded.shown, updated_at=excluded.updated_at
+          shown=excluded.shown, updated_at=excluded.updated_at,
+          kind=excluded.kind, pending_json=excluded.pending_json
     """, (
         sender, session["query"], json.dumps(session["results"]), session["next_page"],
         session["total_pages"], session["shown"], session["updated_at"],
+        session["kind"], json.dumps(session["pending"]) if session.get("pending") else None,
     ))
 
 
@@ -183,7 +267,11 @@ def fill_results(session, needed):
         session["total_pages"] = int(payload.get("totalPages") or page)
         session["next_page"] = page + 1
         for result in payload.get("results") or []:
-            if result.get("mediaType") == "movie" and result.get("id") is not None:
+            if result.get("id") is None:
+                continue
+            if session["kind"] == "show" and result.get("mediaType") == "tv":
+                session["results"].append(show_from_result(result))
+            elif session["kind"] == "movie" and result.get("mediaType") == "movie":
                 session["results"].append(movie_from_result(result))
         fetches += 1
 
@@ -214,6 +302,20 @@ def list_reply(session, batch):
     return "\n".join(lines)
 
 
+def show_list_reply(session, batch):
+    start = session["shown"] + 1
+    end = start + len(batch) - 1
+    minutes = max(1, LIST_TTL // 60)
+    lines = [f'📺 {session["query"]} — reply !{start}–!{end}, "!more", or "!cancel" ({minutes} min)']
+    for number, show in enumerate(batch, start):
+        line = f'!{number} {show["title"]} ({show["year"]}) · {season_label(show)}'
+        badge = status_badge(show.get("status"))
+        if badge:
+            line += f" · {badge}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def grid_for_batch(session, batch):
     clean_old_images()
     token = secrets.token_hex(16)
@@ -225,6 +327,7 @@ def grid_for_batch(session, batch):
             "poster_url": f"https://image.tmdb.org/t/p/w342{poster_path}" if poster_path else None,
             "title": movie["title"], "year": movie["year"],
             "badge": status_badge(movie.get("status")),
+            "subtitle": season_label(movie) if session["kind"] == "show" else None,
         })
     try:
         build_grid(items, str(IMG_DIR / f"{token}.jpg"))
@@ -241,7 +344,11 @@ def show_next_batch(conn, sender, session, now):
         session["updated_at"] = now
         save_session(conn, sender, session)
         return f'No more results for "{session["query"]}".', None
-    reply = list_reply(session, batch)
+    if session["kind"] == "show":
+        enrich_shows(batch)
+        reply = show_list_reply(session, batch)
+    else:
+        reply = list_reply(session, batch)
     image_url = grid_for_batch(session, batch)
     session["shown"] += len(batch)
     session["updated_at"] = now
@@ -324,6 +431,94 @@ def request_movie(conn, sender, number, now):
             f'Reply "!undo" within {minutes} min to cancel.'), None
 
 
+def pick_number(conn, sender, number, now):
+    session = get_live_session(conn, sender, now)
+    if session and session["kind"] == "show":
+        return pick_show(conn, sender, session, number, now)
+    return request_movie(conn, sender, number, now)
+
+
+def pick_show(conn, sender, session, number, now):
+    if number < 1 or number > session["shown"]:
+        return f'Pick a number from the list (!1–!{session["shown"]}).', None
+    show = session["results"][number - 1]
+    label = f'{show["title"]} ({show["year"]})'
+    details = seerr_get_tv(show["tmdb_id"])
+    if details is None:
+        return f"Couldn't load {label}. Try again in a bit.", None
+    numbers, requestable = season_info(details)
+    if not numbers:
+        return f"{label} has no seasons listed yet.", None
+    if not requestable:
+        return f"✅ {label}: every season is already on Jellyfin or requested.", None
+    media_info = details.get("mediaInfo") or {}
+    session["pending"] = {
+        "tmdb_id": show["tmdb_id"], "title": show["title"], "year": show["year"],
+        "media_id": media_info.get("id"), "had_media": bool(media_info),
+        "total": len(numbers), "requestable": requestable,
+    }
+    session["updated_at"] = now
+    save_session(conn, sender, session)
+    plural = "" if len(numbers) == 1 else "s"
+    if len(requestable) == 1:
+        return (f'{label} has {len(numbers)} season{plural}. Reply "!all" to download '
+                f'season {requestable[0]}, or "!cancel".'), None
+    seasons = ", ".join(str(n) for n in requestable)
+    return (f'{label} has {len(numbers)} season{plural}. Reply "!all" for {len(requestable)} seasons, '
+            f'or "!season N" (e.g. !s{requestable[0]}) for one. Available: {seasons}.'), None
+
+
+def confirm_show(conn, sender, choice, now):
+    session = get_live_session(conn, sender, now)
+    pending = session and session.get("pending")
+    if not pending:
+        return 'Pick a show first. Send "!show: <title>" to search.', None
+    label = f'{pending["title"]} ({pending["year"]})'
+    requestable = pending["requestable"]
+    if choice == "all":
+        seasons = requestable
+    elif choice in requestable:
+        seasons = [choice]
+    else:
+        options = ", ".join(str(n) for n in requestable)
+        return f"Season {choice} isn't available to request. Available: {options}.", None
+    used = today_count(conn, sender, now)
+    if used >= DAILY_LIMIT:
+        return f"Daily limit reached ({DAILY_LIMIT}/{DAILY_LIMIT}). Try again tomorrow.", None
+    try:
+        response = requests.post(
+            f"{SEERR_URL}/api/v1/request", headers=seerr_headers(),
+            json={"mediaType": "tv", "mediaId": pending["tmdb_id"], "seasons": seasons}, timeout=15,
+        )
+    except requests.RequestException:
+        log.warning("Seerr request failed for tmdb_id=%s", pending["tmdb_id"])
+        return f'Something went wrong requesting {pending["title"]}. Try again in a bit.', None
+    if response.status_code == 409:
+        return f"⏳ {label} is already requested.", None
+    if not response.ok:
+        log.warning("Seerr request failed: %s %s", response.status_code, response.text[:300])
+        return f'Something went wrong requesting {pending["title"]}. Try again in a bit.', None
+    payload = response.json()
+    media_id = (payload.get("media") or {}).get("id", pending.get("media_id"))
+    conn.execute("""
+        INSERT INTO requests (sender, tmdb_id, title, year, seerr_request_id, seerr_media_id,
+                              radarr_preexisting, created_at, media_type, seasons)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'tv', ?)
+    """, (sender, pending["tmdb_id"], pending["title"], pending["year"], payload.get("id"), media_id,
+          int(pending["had_media"]), now, json.dumps(seasons)))
+    conn.execute("DELETE FROM sessions WHERE sender = ?", (sender,))
+    if len(seasons) == pending["total"]:
+        what = f'all {pending["total"]} season{"" if pending["total"] == 1 else "s"}'
+    elif len(seasons) == 1:
+        what = f"season {seasons[0]}"
+    else:
+        what = "seasons " + ", ".join(str(n) for n in seasons)
+    remaining = DAILY_LIMIT - used - 1
+    minutes = max(1, UNDO_TTL // 60)
+    return (f'⬇️ Requested {label}, {what}. {remaining} of {DAILY_LIMIT} left today. '
+            f'Reply "!undo" within {minutes} min to cancel.'), None
+
+
 def cleanup_response(response, label, ignore_404=False):
     if response.ok or (ignore_404 and response.status_code == 404):
         return True
@@ -375,6 +570,91 @@ def delete_radarr_movie(tmdb_id):
     return all_ok
 
 
+def delete_sonarr_series(tmdb_id):
+    if not SONARR_API_KEY:
+        return False
+    details = seerr_get_tv(tmdb_id) or {}
+    tvdb_id = (details.get("externalIds") or {}).get("tvdbId") or (details.get("mediaInfo") or {}).get("tvdbId")
+    if not tvdb_id:
+        return False
+    try:
+        response = requests.get(
+            f"{SONARR_URL}/api/v3/series", headers=sonarr_headers(),
+            params={"tvdbId": tvdb_id}, timeout=15,
+        )
+        if not cleanup_response(response, "Sonarr series lookup"):
+            return False
+        series_list = response.json()
+    except (requests.RequestException, ValueError):
+        log.exception("Sonarr series lookup failed during undo")
+        return False
+    all_ok = True
+    for series in series_list:
+        series_id = series.get("id")
+        if series_id is None:
+            continue
+        try:
+            queue = requests.get(
+                f"{SONARR_URL}/api/v3/queue", headers=sonarr_headers(),
+                params={"pageSize": 200}, timeout=15,
+            )
+            if cleanup_response(queue, "Sonarr queue lookup"):
+                for item in queue.json().get("records", []):
+                    if item.get("seriesId") == series_id and item.get("id") is not None:
+                        deleted = requests.delete(
+                            f"{SONARR_URL}/api/v3/queue/{item['id']}", headers=sonarr_headers(),
+                            params={"removeFromClient": "true", "blocklist": "false"}, timeout=15,
+                        )
+                        all_ok = cleanup_response(deleted, "Sonarr queue delete") and all_ok
+            else:
+                all_ok = False
+            deleted = requests.delete(
+                f"{SONARR_URL}/api/v3/series/{series_id}", headers=sonarr_headers(),
+                params={"deleteFiles": "true", "addImportExclusion": "false"}, timeout=15,
+            )
+            all_ok = cleanup_response(deleted, "Sonarr series delete") and all_ok
+        except (requests.RequestException, ValueError):
+            log.exception("Sonarr cleanup failed for series_id=%s", series_id)
+            all_ok = False
+    return all_ok
+
+
+def undo_show(conn, item):
+    label = f'{item["title"]} ({item["year"]})'
+    all_ok = True
+    try:
+        # Only touch Sonarr/Seerr media when this request is what added the show.
+        if not item["radarr_preexisting"]:
+            all_ok = delete_sonarr_series(item["tmdb_id"])
+        if item["seerr_request_id"] is not None:
+            try:
+                response = requests.delete(
+                    f"{SEERR_URL}/api/v1/request/{item['seerr_request_id']}",
+                    headers=seerr_headers(), timeout=15,
+                )
+                all_ok = cleanup_response(response, "Seerr request delete", ignore_404=True) and all_ok
+            except requests.RequestException:
+                log.exception("Seerr request cleanup failed")
+                all_ok = False
+        if not item["radarr_preexisting"] and item["seerr_media_id"] is not None:
+            try:
+                response = requests.delete(
+                    f"{SEERR_URL}/api/v1/media/{item['seerr_media_id']}",
+                    headers=seerr_headers(), timeout=15,
+                )
+                all_ok = cleanup_response(response, "Seerr media delete", ignore_404=True) and all_ok
+            except requests.RequestException:
+                log.exception("Seerr media cleanup failed")
+                all_ok = False
+    except Exception:
+        log.exception("Unexpected show undo cleanup failure")
+        all_ok = False
+    conn.execute("UPDATE requests SET undone = 1 WHERE id = ?", (item["id"],))
+    if all_ok:
+        return f"↩️ Cancelled {label}. Download removed.", None
+    return f"↩️ Cancelled {label}, but cleanup was incomplete. Check Sonarr.", None
+
+
 def undo_request(conn, sender, now):
     row = conn.execute("""
         SELECT * FROM requests WHERE sender = ? AND undone = 0 AND created_at >= ?
@@ -384,6 +664,8 @@ def undo_request(conn, sender, now):
         minutes = max(1, UNDO_TTL // 60)
         return f'Nothing to undo. "!undo" only works within {minutes} minutes of a pick.', None
     item = dict(row)
+    if item["media_type"] == "tv":
+        return undo_show(conn, item)
     all_ok = True
     try:
         if not item["radarr_preexisting"]:
@@ -425,14 +707,18 @@ def handle_message(sender, text):
         return "", None
     command_text = message[1:].strip()
     movie_match = MOVIE_RE.match(command_text)
+    show_match = SHOW_RE.match(command_text)
     with db_connection() as conn:
-        if movie_match:
-            query = movie_match.group(1).strip()
-            log.info("message sender=%s command=search", sender)
+        if movie_match or show_match:
+            kind = "movie" if movie_match else "show"
+            query = (movie_match or show_match).group(1).strip()
+            log.info("message sender=%s command=search kind=%s", sender, kind)
             if not query:
+                if kind == "show":
+                    return 'Send "!show: <title>" to search, e.g. !show: Severance', None
                 return 'Send "!movie: <title>" to search, e.g. !movie: Scream', None
             session = {"query": query, "results": [], "next_page": 1, "total_pages": 1,
-                       "shown": 0, "updated_at": now}
+                       "shown": 0, "updated_at": now, "kind": kind, "pending": None}
             try:
                 fill_results(session, PAGE_SIZE)
             except MovieServerUnavailable:
@@ -443,8 +729,15 @@ def handle_message(sender, text):
             return show_next_batch(conn, sender, session, now)
         if PICK_RE.match(command_text):
             log.info("message sender=%s command=pick", sender)
-            return request_movie(conn, sender, int(PICK_RE.match(command_text).group(1)), now)
+            return pick_number(conn, sender, int(PICK_RE.match(command_text).group(1)), now)
+        season_match = SEASON_RE.match(command_text)
+        if season_match:
+            log.info("message sender=%s command=season", sender)
+            return confirm_show(conn, sender, int(season_match.group(1)), now)
         command = command_text.lower()
+        if command == "all":
+            log.info("message sender=%s command=all", sender)
+            return confirm_show(conn, sender, "all", now)
         if command == "more":
             log.info("message sender=%s command=more", sender)
             session = get_live_session(conn, sender, now)
