@@ -1,0 +1,6 @@
+.env
+.secret
+.prompt-*
+*.log
+sample.jpg
+__pycache__/

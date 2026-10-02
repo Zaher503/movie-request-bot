@@ -1,0 +1,31 @@
+services:
+  movie-bot:
+    build: .
+    image: movie-bot:local
+    container_name: movie-bot
+    restart: unless-stopped
+    mem_limit: 192m
+    ports:
+      - 127.0.0.1:8790:8000
+    env_file: .env
+    environment:
+      SEERR_URL: http://media-jellyseerr:5055
+      RADARR_URL: http://media-radarr:7878
+      PUBLIC_BASE: https://zaher.site
+      TZ: America/Los_Angeles
+      DAILY_LIMIT: "5"
+      LIST_TTL: "900"
+      UNDO_TTL: "180"
+      PAGE_SIZE: "5"
+    volumes:
+      - movie-bot-data:/data
+    networks:
+      - media-stack
+
+networks:
+  media-stack:
+    external: true
+
+volumes:
+  movie-bot-data:
+    driver: local
