@@ -41,6 +41,7 @@ DAILY_LIMIT = int(setting("DAILY_LIMIT", "2"))
 LIST_TTL = int(setting("LIST_TTL", "900"))
 UNDO_TTL = int(setting("UNDO_TTL", "180"))
 PAGE_SIZE = int(setting("PAGE_SIZE", "3"))
+HA_WEBHOOK_URL = setting("HA_WEBHOOK_URL", "")
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 IMG_DIR = DATA_DIR / "img"
@@ -93,6 +94,9 @@ def init_db():
                 conn.execute(ddl)
             except sqlite3.OperationalError:
                 pass  # column already exists
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(requests)")]
+        if "notified" not in columns:
+            conn.execute("ALTER TABLE requests ADD COLUMN notified INTEGER NOT NULL DEFAULT 0")
 
 
 init_db()
@@ -290,11 +294,9 @@ def list_reply(session, batch):
     start = session["shown"] + 1
     end = start + len(batch) - 1
     minutes = max(1, LIST_TTL // 60)
-    lines = [f'🎬 {session["query"]} — reply !{start}–!{end}, "!more", or "!cancel" ({minutes} min)']
+    lines = [f'{session["query"]}: reply !{start}-!{end}, !more or !cancel ({minutes} mins)']
     for number, movie in enumerate(batch, start):
         line = f'!{number} {movie["title"]} ({movie["year"]})'
-        if movie["vote_count"]:
-            line += f' · ★{float(movie["rating"]):.1f}'
         badge = status_badge(movie.get("status"))
         if badge:
             line += f" · {badge}"
@@ -306,7 +308,7 @@ def show_list_reply(session, batch):
     start = session["shown"] + 1
     end = start + len(batch) - 1
     minutes = max(1, LIST_TTL // 60)
-    lines = [f'📺 {session["query"]} — reply !{start}–!{end}, "!more", or "!cancel" ({minutes} min)']
+    lines = [f'{session["query"]}: reply !{start}-!{end}, !more or !cancel ({minutes} mins)']
     for number, show in enumerate(batch, start):
         line = f'!{number} {show["title"]} ({show["year"]}) · {season_label(show)}'
         badge = status_badge(show.get("status"))
@@ -463,9 +465,11 @@ def pick_show(conn, sender, session, number, now):
     if len(requestable) == 1:
         return (f'{label} has {len(numbers)} season{plural}. Reply "!all" to download '
                 f'season {requestable[0]}, or "!cancel".'), None
-    seasons = ", ".join(str(n) for n in requestable)
-    return (f'{label} has {len(numbers)} season{plural}. Reply "!all" for {len(requestable)} seasons, '
-            f'or "!season N" (e.g. !s{requestable[0]}) for one. Available: {seasons}.'), None
+    reply = (f'{label} has {len(numbers)} season{plural}. Reply "!all" for all seasons, '
+             f'or "!sx" for a specific season only.')
+    if len(requestable) < len(numbers):
+        reply += " Not yet on Jellyfin: " + ", ".join(str(n) for n in requestable) + "."
+    return reply, None
 
 
 def confirm_show(conn, sender, choice, now):
@@ -699,6 +703,85 @@ def undo_request(conn, sender, now):
     return f'↩️ Cancelled {item["title"]} ({item["year"]}), but cleanup was incomplete. Check Radarr.', None
 
 
+def format_minutes(seconds):
+    minutes = max(1, -(-int(seconds) // 60))
+    if minutes < 120:
+        return f"~{minutes} min"
+    return f"~{minutes // 60} h {minutes % 60} min"
+
+
+def parse_timeleft(value):
+    """Radarr timeleft looks like 'hh:mm:ss' or 'd.hh:mm:ss'."""
+    if not value:
+        return None
+    try:
+        days = 0
+        if "." in value.split(":")[0]:
+            day_part, value = value.split(".", 1)
+            days = int(day_part)
+        hours, minutes, seconds = (int(float(part)) for part in value.split(":"))
+        return days * 86400 + hours * 3600 + minutes * 60 + seconds
+    except ValueError:
+        return None
+
+
+def movie_eta_line(item):
+    """One line about a requested movie: minutes left, or why there is no number."""
+    label = f'{item["title"]} ({item["year"]})'
+    try:
+        response = requests.get(
+            f"{RADARR_URL}/api/v3/movie", headers=radarr_headers(),
+            params={"tmdbId": item["tmdb_id"]}, timeout=15,
+        )
+        response.raise_for_status()
+        movies = response.json()
+        if not movies:
+            return f"{label}: not in the download list yet, check back in a minute."
+        movie = movies[0]
+        if movie.get("hasFile"):
+            return f"{label}: ✅ already downloaded."
+        queue = requests.get(
+            f"{RADARR_URL}/api/v3/queue", headers=radarr_headers(),
+            params={"movieIds": movie["id"], "pageSize": 50}, timeout=15,
+        )
+        queue.raise_for_status()
+        records = queue.json().get("records", [])
+    except (requests.RequestException, ValueError, KeyError):
+        log.warning("ETA lookup failed for tmdb_id=%s", item["tmdb_id"])
+        return f"{label}: couldn't reach the download server."
+    if not records:
+        return f"{label}: still searching for a release, no download yet."
+    record = records[0]
+    left = parse_timeleft(record.get("timeleft"))
+    size = float(record.get("size") or 0)
+    done = 100 - round(100 * float(record.get("sizeleft") or 0) / size) if size else 0
+    state = record.get("trackedDownloadState") or ""
+    if state == "importPending" or state == "importing":
+        return f"{label}: downloaded, being added to Jellyfin now."
+    if left is None or left <= 0 or record.get("status") in ("stalled", "queued", "paused"):
+        return f"{label}: {done}% done, no estimate yet (waiting for speed)."
+    return f"{label}: {format_minutes(left)} left ({done}% done)."
+
+
+def eta_reply(conn, sender, argument):
+    rows = conn.execute("""
+        SELECT * FROM requests WHERE sender = ? AND undone = 0 AND media_type = 'movie'
+        ORDER BY created_at DESC, id DESC LIMIT 5
+    """, (sender,)).fetchall()
+    if not rows:
+        return "No requests yet. Send \"!movie: <title>\" to ask for one.", None
+    items = [dict(row) for row in rows]
+    if argument == "all":
+        lines = [movie_eta_line(item) for item in items]
+        return "⏱️ Your last requests:\n" + "\n".join(lines), None
+    if argument.isdigit() and 1 <= int(argument) <= len(items):
+        return "⏱️ " + movie_eta_line(items[int(argument) - 1]), None
+    reply = "⏱️ " + movie_eta_line(items[0])
+    if len(items) > 1:
+        reply += '\nMore in the list: "!ETA all", or "!ETA 2" for the one before.'
+    return reply, None
+
+
 def handle_message(sender, text):
     now = time.time()
     message = text.strip()
@@ -751,11 +834,44 @@ def handle_message(sender, text):
             log.info("message sender=%s command=cancel", sender)
             conn.execute("DELETE FROM sessions WHERE sender = ?", (sender,))
             return 'Cancelled. Send "!movie: <title>" anytime.', None
+        if command == "eta" or command.startswith("eta "):
+            log.info("message sender=%s command=eta", sender)
+            return eta_reply(conn, sender, command[3:].strip())
         if command == "undo":
             log.info("message sender=%s command=undo", sender)
             return undo_request(conn, sender, now)
         log.info("message sender=%s command=ignored", sender)
         return "", None
+
+
+@app.post("/movie/downloaded")
+def downloaded_endpoint():
+    """Radarr 'On Import' webhook: tell Home Assistant to notify whoever requested the movie."""
+    provided_key = request.headers.get("X-Movie-Key", "")
+    if not hmac.compare_digest(provided_key, SHARED_SECRET):
+        return jsonify(error="forbidden"), 403
+    body = request.get_json(silent=True) or {}
+    if body.get("eventType") != "Download":
+        return jsonify(ok=True, skipped=body.get("eventType")), 200
+    tmdb_id = (body.get("movie") or {}).get("tmdbId")
+    if not tmdb_id or not HA_WEBHOOK_URL:
+        return jsonify(ok=True, skipped="no tmdbId or HA_WEBHOOK_URL"), 200
+    with message_lock, db_connection() as conn:
+        rows = conn.execute("""
+            SELECT * FROM requests WHERE tmdb_id = ? AND media_type = 'movie' AND undone = 0 AND notified = 0
+        """, (tmdb_id,)).fetchall()
+        for row in rows:
+            try:
+                response = requests.post(HA_WEBHOOK_URL, json={
+                    "sender": row["sender"], "title": row["title"],
+                    "year": row["year"], "tmdb_id": tmdb_id,
+                }, timeout=10)
+                response.raise_for_status()
+                conn.execute("UPDATE requests SET notified = 1 WHERE id = ?", (row["id"],))
+                log.info("notified sender=%s tmdb_id=%s", row["sender"], tmdb_id)
+            except requests.RequestException:
+                log.exception("Home Assistant notify failed for tmdb_id=%s", tmdb_id)
+    return jsonify(ok=True, notified=len(rows)), 200
 
 
 @app.get("/movie/health")
