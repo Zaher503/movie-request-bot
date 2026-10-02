@@ -763,20 +763,99 @@ def movie_eta_line(item):
     return f"{label}: {format_minutes(left)} left ({done}% done)."
 
 
+def seasons_label(seasons):
+    if len(seasons) == 1:
+        return f"season {seasons[0]}"
+    return "seasons " + ", ".join(str(n) for n in seasons)
+
+
+def show_eta_line(item):
+    """One line about a requested show, from Sonarr: minutes left, or why there is no number."""
+    wanted = json.loads(item["seasons"]) if item.get("seasons") else []
+    label = f'{item["title"]} ({item["year"]})'
+    if wanted:
+        label += f", {seasons_label(wanted)}"
+    if not SONARR_API_KEY:
+        return f"{label}: no estimate available (Sonarr isn't connected)."
+    details = seerr_get_tv(item["tmdb_id"]) or {}
+    tvdb_id = (details.get("externalIds") or {}).get("tvdbId") or (details.get("mediaInfo") or {}).get("tvdbId")
+    if not tvdb_id:
+        return f"{label}: couldn't look this one up right now."
+    try:
+        response = requests.get(
+            f"{SONARR_URL}/api/v3/series", headers=sonarr_headers(),
+            params={"tvdbId": tvdb_id}, timeout=15,
+        )
+        response.raise_for_status()
+        series_list = response.json()
+        if not series_list:
+            return f"{label}: not in the download list yet, check back in a minute."
+        series = series_list[0]
+        queue = requests.get(
+            f"{SONARR_URL}/api/v3/queue", headers=sonarr_headers(),
+            params={"pageSize": 200, "includeEpisode": "true"}, timeout=15,
+        )
+        queue.raise_for_status()
+        records = queue.json().get("records", [])
+    except (requests.RequestException, ValueError, KeyError):
+        log.warning("Show ETA lookup failed for tmdb_id=%s", item["tmdb_id"])
+        return f"{label}: couldn't reach the download server."
+    have = total = 0
+    for season in series.get("seasons") or []:
+        if not wanted or season.get("seasonNumber") in wanted:
+            stats = season.get("statistics") or {}
+            have += int(stats.get("episodeFileCount") or 0)
+            total += int(stats.get("episodeCount") or 0)
+    mine = []
+    for record in records:
+        if record.get("seriesId") != series.get("id"):
+            continue
+        number = record.get("seasonNumber")
+        if number is None:
+            number = (record.get("episode") or {}).get("seasonNumber")
+        if not wanted or number is None or number in wanted:
+            mine.append(record)
+    if not mine:
+        if total and have >= total:
+            return f"{label}: ✅ already downloaded."
+        if have:
+            return f"{label}: {have} of {total} episodes in, still searching for the rest."
+        return f"{label}: still searching for a release, no download yet."
+    # A season pack is one download shared by many episode rows: count each download once.
+    downloads = {}
+    for record in mine:
+        downloads.setdefault(record.get("downloadId") or record.get("id"), record)
+    size = sum(float(r.get("size") or 0) for r in downloads.values())
+    size_left = sum(float(r.get("sizeleft") or 0) for r in downloads.values())
+    done = 100 - round(100 * size_left / size) if size else 0
+    states = {r.get("trackedDownloadState") or "" for r in downloads.values()}
+    if states <= {"importPending", "importing"}:
+        return f"{label}: downloaded, being added to Jellyfin now."
+    lefts = [parse_timeleft(r.get("timeleft")) for r in downloads.values()]
+    stuck = any(r.get("status") in ("stalled", "queued", "paused") for r in downloads.values())
+    if None in lefts or stuck or max(lefts) <= 0:
+        return f"{label}: {done}% done, no estimate yet (waiting for speed)."
+    return f"{label}: {format_minutes(max(lefts))} left ({done}% done)."
+
+
+def request_eta_line(item):
+    return show_eta_line(item) if item.get("media_type") == "tv" else movie_eta_line(item)
+
+
 def eta_reply(conn, sender, argument):
     rows = conn.execute("""
-        SELECT * FROM requests WHERE sender = ? AND undone = 0 AND media_type = 'movie'
+        SELECT * FROM requests WHERE sender = ? AND undone = 0
         ORDER BY created_at DESC, id DESC LIMIT 5
     """, (sender,)).fetchall()
     if not rows:
         return "No requests yet. Send \"!movie: <title>\" to ask for one.", None
     items = [dict(row) for row in rows]
     if argument == "all":
-        lines = [movie_eta_line(item) for item in items]
+        lines = [request_eta_line(item) for item in items]
         return "⏱️ Your last requests:\n" + "\n".join(lines), None
     if argument.isdigit() and 1 <= int(argument) <= len(items):
-        return "⏱️ " + movie_eta_line(items[int(argument) - 1]), None
-    reply = "⏱️ " + movie_eta_line(items[0])
+        return "⏱️ " + request_eta_line(items[int(argument) - 1]), None
+    reply = "⏱️ " + request_eta_line(items[0])
     if len(items) > 1:
         reply += '\nMore in the list: "!ETA all", or "!ETA 2" for the one before.'
     return reply, None
