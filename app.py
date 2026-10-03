@@ -912,7 +912,8 @@ def handle_message(sender, text):
         if command == "cancel":
             log.info("message sender=%s command=cancel", sender)
             conn.execute("DELETE FROM sessions WHERE sender = ?", (sender,))
-            return 'Cancelled. Send "&movie: <title>" anytime.', None
+            return ('Cancelled. Send "&movie: <title>" or "&show: <title>" anytime, '
+                    'or "&eta" to check on your requests.'), None
         if command == "eta" or command.startswith("eta "):
             log.info("message sender=%s command=eta", sender)
             return eta_reply(conn, sender, command[3:].strip())

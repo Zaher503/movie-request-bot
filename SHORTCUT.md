@@ -25,7 +25,7 @@ Add these actions in order by searching for the exact action names:
 
 2. **Match Text**
    * Search for "Match Text".
-   * Pattern: `(?i)^\s*&\s*(movie:.*|show:.*|\d{1,2}|more|cancel|undo|all|s(eason)?\s*\d{1,2})\s*$`
+   * Pattern: `(?i)^\s*&\s*(movie:.*|show:.*|\d{1,2}|more|cancel|undo|all|eta(\s+(all|\d))?|s(eason)?\s*\d{1,2})\s*$`
    * Text: the Text from step 1.
 
 3. **If**
@@ -112,6 +112,7 @@ You can text this to your wife to show her how to use the bot. Every command nee
 * **&season N** (or **&sN**) - After picking a show, download just that season (e.g. `&s2`)
 * **&more** - See more search results
 * **&cancel** - Cancel the current search
+* **&eta** - Check when your latest request will be ready (`&eta all` for the last 5, `&eta 2` for the one before)
 * **&undo** - Undo the last request (within 3 minutes)
 
 *(Note: There is a daily request limit (a show request counts as one), and search results expire after 15 minutes.)*
