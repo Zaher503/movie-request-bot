@@ -32,7 +32,7 @@ SEERR_API_KEY = setting("SEERR_API_KEY", required=True)
 RADARR_URL = setting("RADARR_URL", "http://radarr:7878").rstrip("/")
 RADARR_API_KEY = setting("RADARR_API_KEY", required=True)
 SONARR_URL = setting("SONARR_URL", "http://sonarr:8989").rstrip("/")
-SONARR_API_KEY = setting("SONARR_API_KEY")  # optional: lets !undo remove a show from Sonarr/qBit
+SONARR_API_KEY = setting("SONARR_API_KEY")  # optional: lets &undo remove a show from Sonarr/qBit
 SHARED_SECRET = setting("SHARED_SECRET", required=True)
 PUBLIC_BASE = setting("PUBLIC_BASE", "https://zaher.site").rstrip("/")
 DATA_DIR = Path(setting("DATA_DIR", "/data"))
@@ -294,9 +294,9 @@ def list_reply(session, batch):
     start = session["shown"] + 1
     end = start + len(batch) - 1
     minutes = max(1, LIST_TTL // 60)
-    lines = [f'{session["query"]}: reply !{start}-!{end}, !more or !cancel ({minutes} mins)']
+    lines = [f'{session["query"]}: reply &{start}-&{end}, &more or &cancel ({minutes} mins)']
     for number, movie in enumerate(batch, start):
-        line = f'!{number} {movie["title"]} ({movie["year"]})'
+        line = f'&{number} {movie["title"]} ({movie["year"]})'
         badge = status_badge(movie.get("status"))
         if badge:
             line += f" · {badge}"
@@ -308,9 +308,9 @@ def show_list_reply(session, batch):
     start = session["shown"] + 1
     end = start + len(batch) - 1
     minutes = max(1, LIST_TTL // 60)
-    lines = [f'{session["query"]}: reply !{start}-!{end}, !more or !cancel ({minutes} mins)']
+    lines = [f'{session["query"]}: reply &{start}-&{end}, &more or &cancel ({minutes} mins)']
     for number, show in enumerate(batch, start):
-        line = f'!{number} {show["title"]} ({show["year"]}) · {season_label(show)}'
+        line = f'&{number} {show["title"]} ({show["year"]}) · {season_label(show)}'
         badge = status_badge(show.get("status"))
         if badge:
             line += f" · {badge}"
@@ -385,9 +385,9 @@ def radarr_preexisting(tmdb_id):
 def request_movie(conn, sender, number, now):
     session = get_live_session(conn, sender, now)
     if not session:
-        return "That list expired. Send \"!movie: <title>\" to search again.", None
+        return "That list expired. Send \"&movie: <title>\" to search again.", None
     if number < 1 or number > session["shown"]:
-        return f'Pick a number from the list (!1–!{session["shown"]}).', None
+        return f'Pick a number from the list (&1–&{session["shown"]}).', None
     movie = session["results"][number - 1]
     details = seerr_get_movie(movie["tmdb_id"])
     if details is not None:
@@ -430,7 +430,7 @@ def request_movie(conn, sender, number, now):
     remaining = DAILY_LIMIT - used - 1
     minutes = max(1, UNDO_TTL // 60)
     return (f'⬇️ Requested {movie["title"]} ({movie["year"]}). {remaining} of {DAILY_LIMIT} left today. '
-            f'Reply "!undo" within {minutes} min to cancel.'), None
+            f'Reply "&undo" within {minutes} min to cancel.'), None
 
 
 def pick_number(conn, sender, number, now):
@@ -442,7 +442,7 @@ def pick_number(conn, sender, number, now):
 
 def pick_show(conn, sender, session, number, now):
     if number < 1 or number > session["shown"]:
-        return f'Pick a number from the list (!1–!{session["shown"]}).', None
+        return f'Pick a number from the list (&1–&{session["shown"]}).', None
     show = session["results"][number - 1]
     label = f'{show["title"]} ({show["year"]})'
     details = seerr_get_tv(show["tmdb_id"])
@@ -463,10 +463,10 @@ def pick_show(conn, sender, session, number, now):
     save_session(conn, sender, session)
     plural = "" if len(numbers) == 1 else "s"
     if len(requestable) == 1:
-        return (f'{label} has {len(numbers)} season{plural}. Reply "!all" to download '
-                f'season {requestable[0]}, or "!cancel".'), None
-    reply = (f'{label} has {len(numbers)} season{plural}. Reply "!all" for all seasons, '
-             f'or "!sx" for a specific season only.')
+        return (f'{label} has {len(numbers)} season{plural}. Reply "&all" to download '
+                f'season {requestable[0]}, or "&cancel".'), None
+    reply = (f'{label} has {len(numbers)} season{plural}. Reply "&all" for all seasons, '
+             f'or "&sx" for a specific season only.')
     if len(requestable) < len(numbers):
         reply += " Not yet on Jellyfin: " + ", ".join(str(n) for n in requestable) + "."
     return reply, None
@@ -476,7 +476,7 @@ def confirm_show(conn, sender, choice, now):
     session = get_live_session(conn, sender, now)
     pending = session and session.get("pending")
     if not pending:
-        return 'Pick a show first. Send "!show: <title>" to search.', None
+        return 'Pick a show first. Send "&show: <title>" to search.', None
     label = f'{pending["title"]} ({pending["year"]})'
     requestable = pending["requestable"]
     if choice == "all":
@@ -520,7 +520,7 @@ def confirm_show(conn, sender, choice, now):
     remaining = DAILY_LIMIT - used - 1
     minutes = max(1, UNDO_TTL // 60)
     return (f'⬇️ Requested {label}, {what}. {remaining} of {DAILY_LIMIT} left today. '
-            f'Reply "!undo" within {minutes} min to cancel.'), None
+            f'Reply "&undo" within {minutes} min to cancel.'), None
 
 
 def cleanup_response(response, label, ignore_404=False):
@@ -666,7 +666,7 @@ def undo_request(conn, sender, now):
     """, (sender, now - UNDO_TTL)).fetchone()
     if row is None:
         minutes = max(1, UNDO_TTL // 60)
-        return f'Nothing to undo. "!undo" only works within {minutes} minutes of a pick.', None
+        return f'Nothing to undo. "&undo" only works within {minutes} minutes of a pick.', None
     item = dict(row)
     if item["media_type"] == "tv":
         return undo_show(conn, item)
@@ -848,7 +848,7 @@ def eta_reply(conn, sender, argument):
         ORDER BY created_at DESC, id DESC LIMIT 5
     """, (sender,)).fetchall()
     if not rows:
-        return "No requests yet. Send \"!movie: <title>\" to ask for one.", None
+        return "No requests yet. Send \"&movie: <title>\" to ask for one.", None
     items = [dict(row) for row in rows]
     if argument == "all":
         lines = [request_eta_line(item) for item in items]
@@ -857,15 +857,15 @@ def eta_reply(conn, sender, argument):
         return "⏱️ " + request_eta_line(items[int(argument) - 1]), None
     reply = "⏱️ " + request_eta_line(items[0])
     if len(items) > 1:
-        reply += '\nMore in the list: "!ETA all", or "!ETA 2" for the one before.'
+        reply += '\nMore in the list: "&ETA all", or "&ETA 2" for the one before.'
     return reply, None
 
 
 def handle_message(sender, text):
     now = time.time()
     message = text.strip()
-    if not message.startswith("!"):
-        log.info("message sender=%s command=ignored (no ! prefix)", sender)
+    if not message.startswith("&"):
+        log.info("message sender=%s command=ignored (no & prefix)", sender)
         return "", None
     command_text = message[1:].strip()
     movie_match = MOVIE_RE.match(command_text)
@@ -877,8 +877,8 @@ def handle_message(sender, text):
             log.info("message sender=%s command=search kind=%s", sender, kind)
             if not query:
                 if kind == "show":
-                    return 'Send "!show: <title>" to search, e.g. !show: Severance', None
-                return 'Send "!movie: <title>" to search, e.g. !movie: Scream', None
+                    return 'Send "&show: <title>" to search, e.g. &show: Severance', None
+                return 'Send "&movie: <title>" to search, e.g. &movie: Scream', None
             session = {"query": query, "results": [], "next_page": 1, "total_pages": 1,
                        "shown": 0, "updated_at": now, "kind": kind, "pending": None}
             try:
@@ -904,7 +904,7 @@ def handle_message(sender, text):
             log.info("message sender=%s command=more", sender)
             session = get_live_session(conn, sender, now)
             if not session:
-                return 'No open list. Send "!movie: <title>" to search.', None
+                return 'No open list. Send "&movie: <title>" to search.', None
             try:
                 return show_next_batch(conn, sender, session, now)
             except MovieServerUnavailable:
@@ -912,7 +912,7 @@ def handle_message(sender, text):
         if command == "cancel":
             log.info("message sender=%s command=cancel", sender)
             conn.execute("DELETE FROM sessions WHERE sender = ?", (sender,))
-            return 'Cancelled. Send "!movie: <title>" anytime.', None
+            return 'Cancelled. Send "&movie: <title>" anytime.', None
         if command == "eta" or command.startswith("eta "):
             log.info("message sender=%s command=eta", sender)
             return eta_reply(conn, sender, command[3:].strip())
