@@ -9,7 +9,7 @@ services:
       - 127.0.0.1:8790:8000
     env_file: .env
     environment:
-      SEERR_URL: http://media-jellyseerr:5055
+      SEERR_URL: http://media-seerr:5055
       RADARR_URL: http://media-radarr:7878
       SONARR_URL: http://media-sonarr:8989
       PUBLIC_BASE: https://zaher.site

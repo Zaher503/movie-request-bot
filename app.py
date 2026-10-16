@@ -27,7 +27,7 @@ def setting(name, default=None, required=False):
     return value
 
 
-SEERR_URL = setting("SEERR_URL", "http://jellyseerr:5055").rstrip("/")
+SEERR_URL = setting("SEERR_URL", "http://seerr:5055").rstrip("/")
 SEERR_API_KEY = setting("SEERR_API_KEY", required=True)
 RADARR_URL = setting("RADARR_URL", "http://radarr:7878").rstrip("/")
 RADARR_API_KEY = setting("RADARR_API_KEY", required=True)
