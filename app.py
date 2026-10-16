@@ -60,6 +60,11 @@ SEASON_RE = re.compile(r"^(?:season\s*|s)(\d{1,2})$", re.IGNORECASE)
 PICK_RE = re.compile(r"^(\d{1,2})$")
 
 
+@app.route("/healthz")
+def healthz():
+    return jsonify(ok=True)
+
+
 class MovieServerUnavailable(Exception):
     pass
 

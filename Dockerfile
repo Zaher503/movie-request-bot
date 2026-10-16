@@ -16,5 +16,7 @@ RUN mkdir /data && chown 568:568 /data
 USER apps
 
 EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4)"
 
 CMD ["gunicorn", "--workers", "1", "--threads", "4", "--bind", "0.0.0.0:8000", "--access-logfile", "-", "app:app"]

@@ -1,7 +1,7 @@
 services:
   movie-bot:
     build: .
-    image: movie-bot:local
+    image: ghcr.io/zaher503/movie-request-bot:${TAG:-latest}
     container_name: movie-bot
     restart: unless-stopped
     mem_limit: 192m
