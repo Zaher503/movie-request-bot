@@ -387,6 +387,21 @@ def radarr_preexisting(tmdb_id):
         return True
 
 
+def seerr_request_missing(payload, title):
+    """Seerr can answer 2xx without creating the request (e.g. "Media data not found")."""
+    request_id = payload.get("id") if isinstance(payload, dict) else None
+    if request_id is not None:
+        try:
+            check = requests.get(f"{SEERR_URL}/api/v1/request/{request_id}", headers=seerr_headers(), timeout=15)
+            if check.ok:
+                return None
+        except requests.RequestException:
+            return None  # Seerr gave an id; a failed double check is not proof of a miss
+    log.error("Seerr accepted the request but created none: title=%s payload=%s", title, str(payload)[:300])
+    return (f"⚠️ Couldn't request {title}: Seerr didn't create the request, so it never reached "
+            f"Sonarr/Radarr (error SEERR-NOREQ). Nothing was saved. Send this to Zaher.")
+
+
 def request_movie(conn, sender, number, now):
     session = get_live_session(conn, sender, now)
     if not session:
@@ -424,6 +439,9 @@ def request_movie(conn, sender, number, now):
         log.warning("Seerr request failed: %s %s", response.status_code, response.text[:300])
         return f'Something went wrong requesting {movie["title"]}. Try again in a bit.', None
     payload = response.json()
+    missing = seerr_request_missing(payload, f'{movie["title"]} ({movie["year"]})')
+    if missing:
+        return missing, None
     request_id = payload.get("id")
     media_id = (payload.get("media") or {}).get("id", media_id)
     conn.execute("""
@@ -508,6 +526,9 @@ def confirm_show(conn, sender, choice, now):
         log.warning("Seerr request failed: %s %s", response.status_code, response.text[:300])
         return f'Something went wrong requesting {pending["title"]}. Try again in a bit.', None
     payload = response.json()
+    missing = seerr_request_missing(payload, label)
+    if missing:
+        return missing, None
     media_id = (payload.get("media") or {}).get("id", pending.get("media_id"))
     conn.execute("""
         INSERT INTO requests (sender, tmdb_id, title, year, seerr_request_id, seerr_media_id,
