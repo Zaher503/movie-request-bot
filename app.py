@@ -495,6 +495,87 @@ def pick_show(conn, sender, session, number, now):
     return reply, None
 
 
+def sonarr_lookup_tvdb(imdb_id):
+    """TMDB sometimes lacks the TVDB link; Sonarr's own lookup can find the show by IMDb id."""
+    if not (SONARR_API_KEY and imdb_id):
+        return None
+    try:
+        response = requests.get(
+            f"{SONARR_URL}/api/v3/series/lookup", headers=sonarr_headers(),
+            params={"term": f"imdb:{imdb_id}"}, timeout=20,
+        )
+        response.raise_for_status()
+        for series in response.json():
+            if series.get("imdbId") == imdb_id and series.get("tvdbId"):
+                return series["tvdbId"]
+    except (requests.RequestException, ValueError):
+        log.warning("Sonarr IMDb lookup failed for imdb_id=%s", imdb_id)
+    return None
+
+
+def resolve_tvdb_id(details):
+    external = details.get("externalIds") or {}
+    return external.get("tvdbId") or (details.get("mediaInfo") or {}).get("tvdbId") or sonarr_lookup_tvdb(external.get("imdbId"))
+
+
+def sonarr_defaults():
+    """Quality profile and folder that Seerr itself uses for Sonarr."""
+    response = requests.get(f"{SEERR_URL}/api/v1/settings/sonarr", headers=seerr_headers(), timeout=15)
+    response.raise_for_status()
+    servers = [s for s in response.json() if not s.get("is4k")]
+    server = next((s for s in servers if s.get("isDefault")), servers[0])
+    return server["activeProfileId"], server["activeDirectory"], server.get("enableSeasonFolders", True)
+
+
+def sonarr_add_show(details, seasons, title):
+    """Add a show straight to Sonarr when Seerr cannot (no TVDB id on TMDB). Returns (ok, error text)."""
+    if not SONARR_API_KEY:
+        return False, "Sonarr isn't connected"
+    tvdb_id = resolve_tvdb_id(details)
+    if not tvdb_id:
+        return False, "no TVDB id on TMDB and Sonarr can't match it by IMDb id"
+    try:
+        existing = requests.get(f"{SONARR_URL}/api/v3/series", headers=sonarr_headers(), params={"tvdbId": tvdb_id}, timeout=15)
+        existing.raise_for_status()
+        if existing.json():
+            return False, "already in Sonarr"
+        lookup = requests.get(f"{SONARR_URL}/api/v3/series/lookup", headers=sonarr_headers(), params={"term": f"tvdb:{tvdb_id}"}, timeout=20)
+        lookup.raise_for_status()
+        series = lookup.json()[0]
+        profile_id, root, season_folders = sonarr_defaults()
+        year = str(details.get("firstAirDate") or series.get("year") or "")[:4]
+        folder = re.sub(r'[\\/:*?"<>|]', "", title).strip() + (f" ({year})" if year else "")
+        series.update(
+            qualityProfileId=profile_id, rootFolderPath=root, path=f"{root.rstrip('/')}/{folder}", monitored=True,
+            seasonFolder=season_folders, tags=[],
+            addOptions={"monitor": "none", "searchForMissingEpisodes": False, "searchForCutoffUnmetEpisodes": False},
+        )
+        for season in series.get("seasons") or []:
+            season["monitored"] = season.get("seasonNumber") in seasons
+        created = requests.post(f"{SONARR_URL}/api/v3/series", headers=sonarr_headers(), json=series, timeout=30)
+        if not created.ok:
+            log.error("Sonarr add failed: %s %s", created.status_code, created.text[:300])
+            return False, f"Sonarr refused it ({created.status_code})"
+        series_id = created.json()["id"]
+        episode_ids = []
+        for _ in range(15):  # Sonarr fills in episodes after its first refresh
+            time.sleep(2)
+            episodes = requests.get(f"{SONARR_URL}/api/v3/episode", headers=sonarr_headers(), params={"seriesId": series_id}, timeout=15).json()
+            episode_ids = [e["id"] for e in episodes if e.get("seasonNumber") in seasons]
+            if episode_ids:
+                break
+        if not episode_ids:
+            return False, "Sonarr added it but found no episodes"
+        requests.put(f"{SONARR_URL}/api/v3/episode/monitor", headers=sonarr_headers(),
+                     json={"episodeIds": episode_ids, "monitored": True}, timeout=15).raise_for_status()
+        requests.post(f"{SONARR_URL}/api/v3/command", headers=sonarr_headers(),
+                      json={"name": "EpisodeSearch", "episodeIds": episode_ids}, timeout=15).raise_for_status()
+        return True, None
+    except (requests.RequestException, ValueError, KeyError, IndexError):
+        log.exception("Sonarr direct add failed for tvdb_id=%s", tvdb_id)
+        return False, "Sonarr request failed"
+
+
 def confirm_show(conn, sender, choice, now):
     session = get_live_session(conn, sender, now)
     pending = session and session.get("pending")
@@ -512,30 +593,42 @@ def confirm_show(conn, sender, choice, now):
     used = today_count(conn, sender, now)
     if used >= DAILY_LIMIT:
         return f"Daily limit reached ({DAILY_LIMIT}/{DAILY_LIMIT}). Try again tomorrow.", None
-    try:
-        response = requests.post(
-            f"{SEERR_URL}/api/v1/request", headers=seerr_headers(),
-            json={"mediaType": "tv", "mediaId": pending["tmdb_id"], "seasons": seasons}, timeout=15,
-        )
-    except requests.RequestException:
-        log.warning("Seerr request failed for tmdb_id=%s", pending["tmdb_id"])
-        return f'Something went wrong requesting {pending["title"]}. Try again in a bit.', None
-    if response.status_code == 409:
-        return f"⏳ {label} is already requested.", None
-    if not response.ok:
-        log.warning("Seerr request failed: %s %s", response.status_code, response.text[:300])
-        return f'Something went wrong requesting {pending["title"]}. Try again in a bit.', None
-    payload = response.json()
-    missing = seerr_request_missing(payload, label)
-    if missing:
-        return missing, None
-    media_id = (payload.get("media") or {}).get("id", pending.get("media_id"))
+    details = seerr_get_tv(pending["tmdb_id"]) or {}
+    external = details.get("externalIds") or {}
+    via_sonarr = not (external.get("tvdbId") or (details.get("mediaInfo") or {}).get("tvdbId"))
+    payload = {}
+    if not via_sonarr:
+        try:
+            response = requests.post(
+                f"{SEERR_URL}/api/v1/request", headers=seerr_headers(),
+                json={"mediaType": "tv", "mediaId": pending["tmdb_id"], "seasons": seasons}, timeout=15,
+            )
+        except requests.RequestException:
+            log.warning("Seerr request failed for tmdb_id=%s", pending["tmdb_id"])
+            return f'Something went wrong requesting {pending["title"]}. Try again in a bit.', None
+        if response.status_code == 409:
+            return f"⏳ {label} is already requested.", None
+        if not response.ok:
+            log.warning("Seerr request failed: %s %s", response.status_code, response.text[:300])
+            return f'Something went wrong requesting {pending["title"]}. Try again in a bit.', None
+        payload = response.json()
+        missing = seerr_request_missing(payload, label)
+        if missing:
+            return missing, None
+    else:
+        # Seerr hands shows to Sonarr by TVDB id, so without one it cannot request this show
+        log.warning("No TVDB id for tmdb_id=%s, adding %s to Sonarr directly", pending["tmdb_id"], label)
+        added, reason = sonarr_add_show(details, seasons, pending["title"])
+        if not added:
+            return (f"⚠️ Couldn't request {label}: Seerr can't find it on TVDB and the direct Sonarr add failed "
+                    f"({reason}) (error NO-TVDB). Nothing was saved. Send this to Zaher."), None
+    media_id = (payload.get("media") or {}).get("id", pending.get("media_id")) if payload else None
     conn.execute("""
         INSERT INTO requests (sender, tmdb_id, title, year, seerr_request_id, seerr_media_id,
                               radarr_preexisting, created_at, media_type, seasons)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'tv', ?)
     """, (sender, pending["tmdb_id"], pending["title"], pending["year"], payload.get("id"), media_id,
-          int(pending["had_media"]), now, json.dumps(seasons)))
+          0 if via_sonarr else int(pending["had_media"]), now, json.dumps(seasons)))
     conn.execute("DELETE FROM sessions WHERE sender = ?", (sender,))
     if len(seasons) == pending["total"]:
         what = f'all {pending["total"]} season{"" if pending["total"] == 1 else "s"}'
@@ -604,7 +697,7 @@ def delete_sonarr_series(tmdb_id):
     if not SONARR_API_KEY:
         return False
     details = seerr_get_tv(tmdb_id) or {}
-    tvdb_id = (details.get("externalIds") or {}).get("tvdbId") or (details.get("mediaInfo") or {}).get("tvdbId")
+    tvdb_id = resolve_tvdb_id(details)
     if not tvdb_id:
         return False
     try:
@@ -804,7 +897,7 @@ def show_eta_line(item):
     if not SONARR_API_KEY:
         return f"{label}: no estimate available (Sonarr isn't connected)."
     details = seerr_get_tv(item["tmdb_id"]) or {}
-    tvdb_id = (details.get("externalIds") or {}).get("tvdbId") or (details.get("mediaInfo") or {}).get("tvdbId")
+    tvdb_id = resolve_tvdb_id(details)
     if not tvdb_id:
         return f"{label}: couldn't look this one up right now."
     try:
