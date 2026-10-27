@@ -39,3 +39,43 @@ def test_sonarr_add_show_without_any_id(monkeypatch):
     monkeypatch.setattr(bot, "resolve_tvdb_id", lambda details: None)
     ok, reason = bot.sonarr_add_show({}, [1], "Show")
     assert not ok and "TVDB" in reason
+
+
+def _show_setup(monkeypatch, have, total, seasons):
+    posts = []
+
+    class Ok:
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(bot, "HA_WEBHOOK_URL", "http://ha/hook")
+    monkeypatch.setattr(bot, "sonarr_series", lambda sid: {"tmdbId": 77, "seasons": [
+        {"seasonNumber": 0, "statistics": {"episodeFileCount": 0, "episodeCount": 3}},
+        {"seasonNumber": 1, "statistics": {"episodeFileCount": have, "episodeCount": total}},
+    ]})
+    monkeypatch.setattr(bot.requests, "post", lambda url, json=None, timeout=None: posts.append(json) or Ok())
+    with bot.db_connection() as conn:
+        conn.execute("DELETE FROM requests")
+        conn.execute(
+            "INSERT INTO requests (sender, tmdb_id, title, year, radarr_preexisting, created_at, media_type, seasons) "
+            "VALUES ('me', 77, 'Show', '2020', 0, 0, 'tv', ?)", (bot.json.dumps(seasons),))
+    return posts
+
+
+def _sonarr_event(client):
+    return client.post("/movie/downloaded", headers={"X-Movie-Key": "x"},
+                       json={"eventType": "Download", "series": {"id": 5, "tmdbId": 77}})
+
+
+def test_show_waits_for_all_requested_episodes(monkeypatch):
+    posts = _show_setup(monkeypatch, 3, 8, [1])
+    assert _sonarr_event(bot.app.test_client()).get_json()["notified"] == 0
+    assert posts == []
+
+
+def test_show_notifies_once_when_complete(monkeypatch):
+    posts = _show_setup(monkeypatch, 8, 8, [1])
+    client = bot.app.test_client()
+    assert _sonarr_event(client).get_json()["notified"] == 1
+    assert posts[0]["media_type"] == "tv" and posts[0]["detail"] == "season 1"
+    assert _sonarr_event(client).get_json()["notified"] == 0

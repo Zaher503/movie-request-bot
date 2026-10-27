@@ -1043,15 +1043,84 @@ def handle_message(sender, text):
         return "", None
 
 
+def post_ready_to_home_assistant(conn, row, tmdb_id, media_type, detail=""):
+    """Tell Home Assistant a request is ready; mark it notified only if the call worked."""
+    try:
+        response = requests.post(HA_WEBHOOK_URL, json={
+            "sender": row["sender"], "title": row["title"], "year": row["year"],
+            "tmdb_id": tmdb_id, "media_type": media_type, "detail": detail,
+        }, timeout=10)
+        response.raise_for_status()
+        conn.execute("UPDATE requests SET notified = 1 WHERE id = ?", (row["id"],))
+        log.info("notified sender=%s media_type=%s tmdb_id=%s", row["sender"], media_type, tmdb_id)
+        return True
+    except requests.RequestException:
+        log.exception("Home Assistant notify failed for tmdb_id=%s", tmdb_id)
+        return False
+
+
+def sonarr_series(series_id):
+    """The Sonarr series record (with per-season statistics), or None."""
+    try:
+        response = requests.get(f"{SONARR_URL}/api/v3/series/{series_id}", headers=sonarr_headers(), timeout=15)
+        response.raise_for_status()
+        return response.json()
+    except (requests.RequestException, ValueError):
+        log.warning("Sonarr series lookup failed for series_id=%s", series_id)
+        return None
+
+
+def seasons_complete(series, wanted):
+    """True once every aired episode of the requested seasons (all seasons if none) has a file."""
+    have = total = 0
+    for season in series.get("seasons") or []:
+        number = season.get("seasonNumber") or 0
+        if number > 0 and (not wanted or number in wanted):
+            stats = season.get("statistics") or {}
+            have += int(stats.get("episodeFileCount") or 0)
+            total += int(stats.get("episodeCount") or 0)
+    return total > 0 and have >= total
+
+
+def notify_show_ready(body):
+    series = body.get("series") or {}
+    series_id = series.get("id")
+    if not series_id:
+        return jsonify(ok=True, skipped="no series id"), 200
+    full = sonarr_series(series_id)
+    if full is None:
+        return jsonify(error="sonarr unavailable"), 502
+    tmdb_id = series.get("tmdbId") or full.get("tmdbId")
+    if not tmdb_id:
+        return jsonify(ok=True, skipped="no tmdbId"), 200
+    notified = 0
+    with message_lock, db_connection() as conn:
+        rows = conn.execute("""
+            SELECT * FROM requests WHERE tmdb_id = ? AND media_type = 'tv' AND undone = 0 AND notified = 0
+        """, (tmdb_id,)).fetchall()
+        for row in rows:
+            wanted = json.loads(row["seasons"]) if row["seasons"] else []
+            if not seasons_complete(full, wanted):
+                continue
+            detail = seasons_label(wanted) if wanted else "all seasons"
+            if post_ready_to_home_assistant(conn, row, tmdb_id, "tv", detail):
+                notified += 1
+    return jsonify(ok=True, notified=notified), 200
+
+
 @app.post("/movie/downloaded")
 def downloaded_endpoint():
-    """Radarr 'On Import' webhook: tell Home Assistant to notify whoever requested the movie."""
+    """Radarr/Sonarr 'On Import' webhook: tell Home Assistant to notify whoever requested it."""
     provided_key = request.headers.get("X-Movie-Key", "")
     if not hmac.compare_digest(provided_key, SHARED_SECRET):
         return jsonify(error="forbidden"), 403
     body = request.get_json(silent=True) or {}
     if body.get("eventType") != "Download":
         return jsonify(ok=True, skipped=body.get("eventType")), 200
+    if body.get("series"):
+        if not HA_WEBHOOK_URL or not SONARR_API_KEY:
+            return jsonify(ok=True, skipped="no HA_WEBHOOK_URL or SONARR_API_KEY"), 200
+        return notify_show_ready(body)
     tmdb_id = (body.get("movie") or {}).get("tmdbId")
     if not tmdb_id or not HA_WEBHOOK_URL:
         return jsonify(ok=True, skipped="no tmdbId or HA_WEBHOOK_URL"), 200
@@ -1060,16 +1129,7 @@ def downloaded_endpoint():
             SELECT * FROM requests WHERE tmdb_id = ? AND media_type = 'movie' AND undone = 0 AND notified = 0
         """, (tmdb_id,)).fetchall()
         for row in rows:
-            try:
-                response = requests.post(HA_WEBHOOK_URL, json={
-                    "sender": row["sender"], "title": row["title"],
-                    "year": row["year"], "tmdb_id": tmdb_id,
-                }, timeout=10)
-                response.raise_for_status()
-                conn.execute("UPDATE requests SET notified = 1 WHERE id = ?", (row["id"],))
-                log.info("notified sender=%s tmdb_id=%s", row["sender"], tmdb_id)
-            except requests.RequestException:
-                log.exception("Home Assistant notify failed for tmdb_id=%s", tmdb_id)
+            post_ready_to_home_assistant(conn, row, tmdb_id, "movie")
     return jsonify(ok=True, notified=len(rows)), 200
 
 
