@@ -1235,27 +1235,127 @@ def message_endpoint():
         return jsonify(reply="Movie bot hit an error. Try again later.", image_url=None)
 
 
-ADMIN_PAGE = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Remove media</title>
-<style>body{font:16px system-ui;background:#111;color:#eee;max-width:640px;margin:2rem auto;padding:0 1rem}
-input{width:100%;padding:.7rem;font-size:1rem;border-radius:8px;border:1px solid #444;background:#1c1c1c;color:#eee;box-sizing:border-box}
-.row{display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:.7rem 0;border-bottom:1px solid #2a2a2a}
-small{color:#999}button{background:#c0392b;color:#fff;border:0;border-radius:8px;padding:.5rem .9rem;font-size:.95rem}
-#msg{margin:1rem 0;color:#8fd18f;white-space:pre-line}</style>
-<h2>Remove a movie or show</h2>
-<p><small>Deletes the files, the torrent, the Radarr/Sonarr entry and the Seerr request, then rescans Jellyfin.</small></p>
-<input id=q placeholder="Search your library..." autofocus><div id=msg></div><div id=list></div>
+ADMIN_PAGE = """<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Remove Media</title>
+<style>
+:root{
+  --bg:#f2f2f7;--card:#ffffff;--label:#000000;--label2:#6c6c70;--sep:rgba(60,60,67,.18);
+  --fill:rgba(118,118,128,.12);--red:#d70015;--red-fill:rgba(215,0,21,.10);--green:#1f7a3a;
+  --scrim:rgba(0,0,0,.35);--sheet:#ffffff;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#000000;--card:#1c1c1e;--label:#ffffff;--label2:#a1a1a6;--sep:rgba(84,84,88,.55);
+  --fill:rgba(118,118,128,.24);--red:#ff6961;--red-fill:rgba(255,105,97,.16);--green:#5fd37f;
+  --scrim:rgba(0,0,0,.55);--sheet:#2c2c2e;
+}}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html{background:var(--bg)}
+body{margin:0;font:17px/1.35 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",system-ui,sans-serif;
+  color:var(--label);background:var(--bg);padding:max(20px,env(safe-area-inset-top)) 16px 48px;
+  -webkit-font-smoothing:antialiased}
+main{max-width:640px;margin:0 auto}
+h1{font:700 34px/1.12 -apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",system-ui,sans-serif;
+  letter-spacing:-.4px;margin:28px 0 6px}
+.lede{margin:0 0 20px;color:var(--label2);font-size:15px}
+.search{position:relative;margin-bottom:20px}
+.search svg{position:absolute;left:12px;top:50%;width:18px;height:18px;margin-top:-9px;color:var(--label2);pointer-events:none}
+.search input{width:100%;height:44px;border:0;border-radius:12px;background:var(--fill);color:var(--label);
+  font:inherit;padding:0 12px 0 38px;outline:none}
+.search input::placeholder{color:var(--label2)}
+.search input:focus-visible,button:focus-visible{outline:3px solid #0a84ff;outline-offset:2px}
+#status{min-height:22px;margin:0 4px 12px;font-size:15px;color:var(--green)}
+#status.err{color:var(--red)}
+.group{background:var(--card);border-radius:14px;overflow:hidden}
+.row{display:flex;align-items:center;gap:12px;min-height:64px;padding:10px 8px 10px 16px;position:relative}
+.row+.row::before{content:"";position:absolute;top:0;left:16px;right:0;height:1px;background:var(--sep)}
+.meta{flex:1;min-width:0}
+.title{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sub{font-size:14px;color:var(--label2);margin-top:1px}
+.del{min-width:44px;height:44px;border:0;border-radius:22px;background:transparent;color:var(--red);
+  font:inherit;font-weight:500;padding:0 14px;cursor:pointer}
+.del:hover{background:var(--red-fill)}
+.empty{padding:40px 16px;text-align:center;color:var(--label2);font-size:15px}
+dialog{border:0;padding:0;background:transparent;max-width:none;max-height:none;width:100%;
+  margin:auto auto 0;color:var(--label)}
+dialog::backdrop{background:var(--scrim)}
+.sheet{background:var(--sheet);border-radius:20px 20px 0 0;max-width:640px;margin:0 auto;
+  padding:24px 20px max(20px,env(safe-area-inset-bottom));animation:up .28s cubic-bezier(.2,.8,.2,1)}
+@media (min-width:700px){dialog{margin:auto}.sheet{border-radius:20px;width:420px}}
+.sheet h2{font-size:20px;font-weight:600;line-height:1.25;margin:0 0 8px}
+.sheet p{margin:0 0 20px;color:var(--label2);font-size:15px}
+.sheet ul{margin:0 0 20px;padding:0;list-style:none;font-size:15px;color:var(--label2)}
+.sheet li{padding:3px 0}
+.btns{display:grid;gap:10px}
+.btns button{height:50px;border:0;border-radius:14px;font:inherit;font-weight:600;cursor:pointer}
+.btn-del{background:var(--red);color:#fff}
+.btn-cancel{background:var(--fill);color:var(--label)}
+@keyframes up{from{transform:translateY(24px);opacity:0}to{transform:none;opacity:1}}
+@media (prefers-reduced-motion:reduce){.sheet{animation:none}}
+</style>
+<main>
+  <h1>Remove Media</h1>
+  <p class="lede">Search your library, then remove a movie or show everywhere it lives.</p>
+  <label class="search">
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"/><path d="M13 13l4 4"/></svg>
+    <input id="q" type="search" placeholder="Search" aria-label="Search your library" autocomplete="off" autofocus>
+  </label>
+  <div id="status" role="status" aria-live="polite"></div>
+  <div id="list" class="group" hidden></div>
+  <div id="hint" class="empty">Type a title to find it.</div>
+</main>
+<dialog id="dlg" aria-labelledby="dt">
+  <div class="sheet">
+    <h2 id="dt"></h2>
+    <p>This can't be undone.</p>
+    <ul>
+      <li>Files and torrent in qBittorrent</li>
+      <li>The Radarr or Sonarr entry</li>
+      <li>The Seerr request, so it can be requested again</li>
+    </ul>
+    <div class="btns">
+      <button class="btn-del" id="yes">Delete</button>
+      <button class="btn-cancel" id="no">Cancel</button>
+    </div>
+  </div>
+</dialog>
 <script>
-const $=id=>document.getElementById(id);let t;
+const $=id=>document.getElementById(id);let t,pending=null;
+const status=(m,e)=>{$('status').textContent=m||'';$('status').className=e?'err':''};
 $('q').oninput=()=>{clearTimeout(t);t=setTimeout(search,250)};
-async function search(){const q=$('q').value.trim();if(!q){$('list').innerHTML='';return}
-const r=await (await fetch('admin/api/search?q='+encodeURIComponent(q))).json();
-$('list').innerHTML='';r.items.forEach(i=>{const d=document.createElement('div');d.className='row';
-d.innerHTML='<span></span><button>Delete</button>';
-d.firstChild.innerHTML=i.title+(i.year?' ('+i.year+')':'')+'<br><small>'+i.kind+' · '+(i.size/2**30).toFixed(1)+' GB</small>';
-d.lastChild.onclick=async()=>{if(!confirm('Permanently delete '+i.title+'?'))return;d.lastChild.disabled=true;
-const x=await (await fetch('admin/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:i.kind,id:i.id,title:i.title})})).json();
-$('msg').textContent=x.message;d.remove()};$('list').appendChild(d)})}
+async function search(){
+  const q=$('q').value.trim();
+  if(!q){$('list').hidden=true;$('hint').hidden=false;$('hint').textContent='Type a title to find it.';return}
+  let r;try{r=await (await fetch('admin/api/search?q='+encodeURIComponent(q))).json()}
+  catch(e){status('Search failed. Check your connection and try again.',1);return}
+  const l=$('list');l.textContent='';
+  l.hidden=!r.items.length;$('hint').hidden=!!r.items.length;
+  $('hint').textContent='Nothing in your library matches "'+q+'".';
+  r.items.forEach(i=>{
+    const d=document.createElement('div');d.className='row';
+    const m=document.createElement('div');m.className='meta';
+    const a=document.createElement('div');a.className='title';a.textContent=i.title+(i.year?' ('+i.year+')':'');
+    const b=document.createElement('div');b.className='sub';
+    b.textContent=(i.kind==='show'?'Show':'Movie')+' · '+(i.size/2**30).toFixed(1)+' GB';
+    m.append(a,b);
+    const x=document.createElement('button');x.className='del';x.textContent='Delete';
+    x.setAttribute('aria-label','Delete '+i.title);
+    x.onclick=()=>{pending={i,d,x};$('dt').textContent='Delete “'+i.title+'”?';$('dlg').showModal()};
+    d.append(m,x);l.append(d)})}
+$('no').onclick=()=>{pending=null;$('dlg').close()};
+$('dlg').addEventListener('click',e=>{if(e.target===$('dlg'))$('no').click()});
+$('yes').onclick=async()=>{
+  const p=pending;if(!p)return;$('dlg').close();p.x.disabled=true;p.x.textContent='Deleting…';status('');
+  try{
+    const x=await (await fetch('admin/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({kind:p.i.kind,id:p.i.id,title:p.i.title})})).json();
+    status(x.message||x.error,!x.message);if(x.message)p.d.remove();else{p.x.disabled=false;p.x.textContent='Delete'}
+    if(!$('list').children.length){$('list').hidden=true;$('hint').hidden=false;$('hint').textContent='Type a title to find it.'}
+  }catch(e){status('Delete failed. Nothing was confirmed removed.',1);p.x.disabled=false;p.x.textContent='Delete'}
+  pending=null};
 </script>"""
 
 
