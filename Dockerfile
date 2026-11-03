@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py grid.py ./
+COPY app.py grid.py purge.py ./
 
 RUN groupadd -g 568 apps && useradd -u 568 -g 568 -m apps
 RUN mkdir /data && chown 568:568 /data

@@ -18,6 +18,7 @@ import requests
 from flask import Flask, jsonify, request, send_from_directory
 
 from grid import build_grid
+from purge import find_library, purge
 
 
 def setting(name, default=None, required=False):
@@ -42,6 +43,9 @@ LIST_TTL = int(setting("LIST_TTL", "900"))
 UNDO_TTL = int(setting("UNDO_TTL", "180"))
 PAGE_SIZE = int(setting("PAGE_SIZE", "3"))
 HA_WEBHOOK_URL = setting("HA_WEBHOOK_URL", "")
+DELETE_SENDERS = {s.strip().lower() for s in setting("DELETE_SENDERS", "zaher,kathy").split(",") if s.strip()}
+ADMIN_KEY = setting("ADMIN_KEY", "")  # set by Caddy on the Authentik-gated remove page
+DELETE_TTL = int(setting("DELETE_TTL", "120"))
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 IMG_DIR = DATA_DIR / "img"
@@ -56,6 +60,9 @@ SENDER_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 TOKEN_RE = re.compile(r"^[a-f0-9]{32}$")
 MOVIE_RE = re.compile(r"^movie:\s*(.*)$", re.IGNORECASE | re.DOTALL)
 SHOW_RE = re.compile(r"^show:\s*(.*)$", re.IGNORECASE | re.DOTALL)
+DELETE_RE = re.compile(r"^(?:delete|remove)\s*:?\s*(.*)$", re.IGNORECASE | re.DOTALL)
+DEL_PICK_RE = re.compile(r"^del\s*(\d{1,2})$", re.IGNORECASE)
+pending_deletes = {}  # sender -> (expires_at, [library items])
 SEASON_RE = re.compile(r"^(?:season\s*|s)(\d{1,2})$", re.IGNORECASE)
 PICK_RE = re.compile(r"^(\d{1,2})$")
 
@@ -980,6 +987,56 @@ def eta_reply(conn, sender, argument):
     return reply, None
 
 
+def item_label(item):
+    gigabytes = item["size"] / 2**30
+    year = f' ({item["year"]})' if item.get("year") else ""
+    kind = "show" if item["kind"] == "show" else "movie"
+    return f'{item["title"]}{year} [{kind}, {gigabytes:.1f} GB]'
+
+
+def run_purge(item):
+    steps = purge(item["kind"], item["id"])
+    log.info("purge kind=%s id=%s steps=%s", item["kind"], item["id"], steps)
+    failed = [f"{name}: {detail}" for name, ok, detail in steps if not ok]
+    if failed:
+        return f'Removed {item_label(item)}, but: {"; ".join(failed)}'
+    return f'🗑️ Removed {item_label(item)}. Files, download, request and library entry are gone; you can request it again.'
+
+
+def delete_flow(sender, now, delete_pick, delete_match, command_text):
+    if sender not in DELETE_SENDERS:
+        log.info("message sender=%s command=delete denied", sender)
+        return "You can't delete things from here.", None
+    pending = pending_deletes.get(sender)
+    if pending and pending[0] < now:
+        pending = None
+        pending_deletes.pop(sender, None)
+    if delete_pick:
+        number = int(delete_pick.group(1))
+        if not pending or not 1 <= number <= len(pending[1]):
+            return 'Nothing to pick. Send "&delete <title>" first.', None
+        item = pending[1][number - 1]
+        pending_deletes.pop(sender, None)
+        return run_purge(item), None
+    if command_text.lower() == "yes":
+        if not pending or len(pending[1]) != 1:
+            return 'Nothing waiting to confirm. Send "&delete <title>" first.', None
+        pending_deletes.pop(sender, None)
+        return run_purge(pending[1][0]), None
+    query = delete_match.group(1).strip()
+    if not query:
+        return 'Send "&delete <title>", e.g. &delete Hereditary', None
+    matches = find_library(query)[:5]
+    if not matches:
+        return f'Nothing in the library matches "{query}".', None
+    pending_deletes[sender] = (now + DELETE_TTL, matches)
+    if len(matches) == 1:
+        return (f'Delete {item_label(matches[0])}? This removes the files and the download. '
+                f'Reply "&yes" within {max(1, DELETE_TTL // 60)} min to confirm.'), None
+    lines = [f"{n}. {item_label(item)}" for n, item in enumerate(matches, 1)]
+    return "Which one?\n" + "\n".join(lines) + '\nReply "&del <number>" to delete it.', None
+
+
 def handle_message(sender, text):
     now = time.time()
     message = text.strip()
@@ -1015,6 +1072,10 @@ def handle_message(sender, text):
         if season_match:
             log.info("message sender=%s command=season", sender)
             return confirm_show(conn, sender, int(season_match.group(1)), now)
+        delete_pick = DEL_PICK_RE.match(command_text)
+        delete_match = DELETE_RE.match(command_text)
+        if delete_pick or delete_match or command_text.lower() == "yes":
+            return delete_flow(sender, now, delete_pick, delete_match, command_text)
         command = command_text.lower()
         if command == "all":
             log.info("message sender=%s command=all", sender)
@@ -1172,6 +1233,62 @@ def message_endpoint():
     except Exception:
         log.error("Unexpected movie message error:\n%s", traceback.format_exc())
         return jsonify(reply="Movie bot hit an error. Try again later.", image_url=None)
+
+
+ADMIN_PAGE = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Remove media</title>
+<style>body{font:16px system-ui;background:#111;color:#eee;max-width:640px;margin:2rem auto;padding:0 1rem}
+input{width:100%;padding:.7rem;font-size:1rem;border-radius:8px;border:1px solid #444;background:#1c1c1c;color:#eee;box-sizing:border-box}
+.row{display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:.7rem 0;border-bottom:1px solid #2a2a2a}
+small{color:#999}button{background:#c0392b;color:#fff;border:0;border-radius:8px;padding:.5rem .9rem;font-size:.95rem}
+#msg{margin:1rem 0;color:#8fd18f;white-space:pre-line}</style>
+<h2>Remove a movie or show</h2>
+<p><small>Deletes the files, the torrent, the Radarr/Sonarr entry and the Seerr request, then rescans Jellyfin.</small></p>
+<input id=q placeholder="Search your library..." autofocus><div id=msg></div><div id=list></div>
+<script>
+const $=id=>document.getElementById(id);let t;
+$('q').oninput=()=>{clearTimeout(t);t=setTimeout(search,250)};
+async function search(){const q=$('q').value.trim();if(!q){$('list').innerHTML='';return}
+const r=await (await fetch('admin/api/search?q='+encodeURIComponent(q))).json();
+$('list').innerHTML='';r.items.forEach(i=>{const d=document.createElement('div');d.className='row';
+d.innerHTML='<span></span><button>Delete</button>';
+d.firstChild.innerHTML=i.title+(i.year?' ('+i.year+')':'')+'<br><small>'+i.kind+' · '+(i.size/2**30).toFixed(1)+' GB</small>';
+d.lastChild.onclick=async()=>{if(!confirm('Permanently delete '+i.title+'?'))return;d.lastChild.disabled=true;
+const x=await (await fetch('admin/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:i.kind,id:i.id,title:i.title})})).json();
+$('msg').textContent=x.message;d.remove()};$('list').appendChild(d)})}
+</script>"""
+
+
+def admin_allowed():
+    return bool(ADMIN_KEY) and hmac.compare_digest(request.headers.get("X-Admin-Key", ""), ADMIN_KEY)
+
+
+@app.get("/admin/")
+def admin_page():
+    if not admin_allowed():
+        return "forbidden", 403
+    return ADMIN_PAGE
+
+
+@app.get("/admin/api/search")
+def admin_search():
+    if not admin_allowed():
+        return jsonify(error="forbidden"), 403
+    return jsonify(items=find_library(request.args.get("q", ""))[:20])
+
+
+@app.post("/admin/api/delete")
+def admin_delete():
+    if not admin_allowed():
+        return jsonify(error="forbidden"), 403
+    body = request.get_json(silent=True) or {}
+    kind, item_id = body.get("kind"), body.get("id")
+    if kind not in ("movie", "show") or not isinstance(item_id, int):
+        return jsonify(error="invalid request"), 400
+    with message_lock:
+        item = {"kind": kind, "id": item_id, "title": str(body.get("title", f"{kind} {item_id}"))[:120],
+                "year": None, "size": 0}
+        return jsonify(message=run_purge(item).replace(" [movie, 0.0 GB]", "").replace(" [show, 0.0 GB]", ""))
 
 
 if __name__ == "__main__":

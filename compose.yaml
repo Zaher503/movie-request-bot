@@ -12,6 +12,9 @@ services:
       SEERR_URL: http://media-seerr:5055
       RADARR_URL: http://media-radarr:7878
       SONARR_URL: http://media-sonarr:8989
+      QBIT_URL: http://media-qbittorrent:8080
+      JELLYFIN_URL: http://media-jellyfin:8096
+      DELETE_SENDERS: "zaher,kathy"
       PUBLIC_BASE: https://zaher.site
       TZ: America/Los_Angeles
       DAILY_LIMIT: "5"

@@ -79,3 +79,23 @@ def test_show_notifies_once_when_complete(monkeypatch):
     assert _sonarr_event(client).get_json()["notified"] == 1
     assert posts[0]["media_type"] == "tv" and posts[0]["detail"] == "season 1"
     assert _sonarr_event(client).get_json()["notified"] == 0
+
+
+def test_delete_requires_allowed_sender():
+    reply, _ = bot.handle_message("stranger", "&delete Hereditary")
+    assert "can't delete" in reply
+
+
+def test_delete_flow_confirms_then_purges(monkeypatch):
+    item = {"kind": "movie", "id": 7, "title": "Hereditary", "year": 2018, "size": 2**30}
+    monkeypatch.setattr(bot, "find_library", lambda q: [item])
+    calls = []
+    monkeypatch.setattr(bot, "purge", lambda kind, i: calls.append((kind, i)) or [("Radarr", True, "ok")])
+    reply, _ = bot.handle_message("kathy", "&delete Hereditary")
+    assert "&yes" in reply and not calls
+    reply, _ = bot.handle_message("kathy", "&yes")
+    assert calls == [("movie", 7)] and "Removed" in reply
+
+
+def test_admin_requires_key():
+    assert bot.app.test_client().get("/admin/").status_code == 403
