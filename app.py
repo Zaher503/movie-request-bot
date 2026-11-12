@@ -292,6 +292,29 @@ def fill_results(session, needed):
         fetches += 1
 
 
+def wrong_kind_reply(kind, query):
+    # Nothing matched the requested kind; check whether the other kind has a match
+    other = "movie" if kind == "show" else "show"
+    api_type = "movie" if other == "movie" else "tv"
+    try:
+        payload = seerr_search(query, 1)
+    except MovieServerUnavailable:
+        payload = {}
+    titles = []
+    for result in payload.get("results") or []:
+        if result.get("id") is None or result.get("mediaType") != api_type:
+            continue
+        item = movie_from_result(result) if other == "movie" else show_from_result(result)
+        titles.append(f"{item['title']} ({item['year']})")
+        if len(titles) == 2:
+            break
+    if not titles:
+        return f'Nothing found for "{query}". Check the spelling and try again.'
+    log.info("search kind=%s query=%r no match, found %s instead: %s", kind, query, other, titles)
+    return (f'No {kind} found for "{query}", but there is a {other}: {" / ".join(titles)}. '
+            f'Try "&{other}: {query}" instead.')
+
+
 def clean_old_images():
     cutoff = time.time() - 3600
     for path in IMG_DIR.glob("*.jpg"):
@@ -1050,7 +1073,7 @@ def handle_message(sender, text):
         if movie_match or show_match:
             kind = "movie" if movie_match else "show"
             query = (movie_match or show_match).group(1).strip()
-            log.info("message sender=%s command=search kind=%s", sender, kind)
+            log.info("message sender=%s command=search kind=%s query=%r", sender, kind, query)
             if not query:
                 if kind == "show":
                     return 'Send "&show: <title>" to search, e.g. &show: Severance', None
@@ -1063,7 +1086,8 @@ def handle_message(sender, text):
                 return "Couldn't reach the movie server. Try again later.", None
             conn.execute("DELETE FROM sessions WHERE sender = ?", (sender,))
             if not session["results"]:
-                return f'Nothing found for "{query}". Check the spelling and try again.', None
+                log.info("search sender=%s kind=%s query=%r results=0", sender, kind, query)
+                return wrong_kind_reply(kind, query), None
             return show_next_batch(conn, sender, session, now)
         if PICK_RE.match(command_text):
             log.info("message sender=%s command=pick", sender)

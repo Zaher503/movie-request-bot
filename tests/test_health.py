@@ -99,3 +99,15 @@ def test_delete_flow_confirms_then_purges(monkeypatch):
 
 def test_admin_requires_key():
     assert bot.app.test_client().get("/admin/").status_code == 403
+
+
+def test_wrong_kind_reply_suggests_other_kind(monkeypatch):
+    movie = {"id": 1, "mediaType": "movie", "title": "Widows' Peak", "releaseDate": "1994-01-01"}
+    monkeypatch.setattr(bot, "seerr_search", lambda q, page: {"results": [movie]})
+    reply = bot.wrong_kind_reply("show", "widows peak")
+    assert "&movie: widows peak" in reply and "Widows' Peak (1994)" in reply
+
+
+def test_wrong_kind_reply_nothing_found(monkeypatch):
+    monkeypatch.setattr(bot, "seerr_search", lambda q, page: {"results": []})
+    assert bot.wrong_kind_reply("movie", "zzzz").startswith('Nothing found for "zzzz"')
