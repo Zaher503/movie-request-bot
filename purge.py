@@ -22,10 +22,10 @@ def _norm(text):
     return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
 
-def find_library(query):
-    """Return library items whose title contains the query, newest first."""
+def find_library(query, allow_all=False):
+    """Return library items whose title contains the query. An empty query lists everything if allow_all."""
     wanted = _norm(query)
-    if not wanted:
+    if not wanted and not allow_all:
         return []
     items = []
     for kind, base, key, path in (
@@ -46,7 +46,7 @@ def find_library(query):
                     "kind": kind, "id": entry["id"], "title": entry["title"],
                     "year": entry.get("year"), "tmdb_id": entry.get("tmdbId"), "size": size,
                 })
-    items.sort(key=lambda i: (_norm(i["title"]) != wanted, i["title"]))
+    items.sort(key=lambda i: (_norm(i["title"]) != wanted, i["title"].lower()))
     return items
 
 

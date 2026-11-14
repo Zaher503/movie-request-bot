@@ -1300,8 +1300,10 @@ h1{font:700 34px/1.12 -apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe U
 .title{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sub{font-size:14px;color:var(--label2);margin-top:1px}
 .del{min-width:44px;height:44px;border:0;border-radius:22px;background:transparent;color:var(--red);
-  font:inherit;font-weight:500;padding:0 14px;cursor:pointer}
+  font:inherit;font-weight:500;padding:0;cursor:pointer}
 .del:hover{background:var(--red-fill)}
+.del svg{width:22px;height:22px;display:block;margin:auto}
+.del:disabled{opacity:.4;cursor:default}
 .empty{padding:40px 16px;text-align:center;color:var(--label2);font-size:15px}
 dialog{border:0;padding:0;background:transparent;max-width:none;max-height:none;width:100%;
   margin:auto auto 0;color:var(--label)}
@@ -1322,14 +1324,14 @@ dialog::backdrop{background:var(--scrim)}
 </style>
 <main>
   <h1>Remove Media</h1>
-  <p class="lede">Search your library, then remove a movie or show everywhere it lives.</p>
+  <p class="lede">Tap Delete next to a movie or show to remove it everywhere it lives.</p>
   <label class="search">
     <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"/><path d="M13 13l4 4"/></svg>
     <input id="q" type="search" placeholder="Search" aria-label="Search your library" autocomplete="off" autofocus>
   </label>
   <div id="status" role="status" aria-live="polite"></div>
   <div id="list" class="group" hidden></div>
-  <div id="hint" class="empty">Type a title to find it.</div>
+  <div id="hint" class="empty">Loading your library…</div>
 </main>
 <dialog id="dlg" aria-labelledby="dt">
   <div class="sheet">
@@ -1348,16 +1350,16 @@ dialog::backdrop{background:var(--scrim)}
 </dialog>
 <script>
 const $=id=>document.getElementById(id);let t,pending=null;
+const TRASH='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>';
 const status=(m,e)=>{$('status').textContent=m||'';$('status').className=e?'err':''};
 $('q').oninput=()=>{clearTimeout(t);t=setTimeout(search,250)};
 async function search(){
   const q=$('q').value.trim();
-  if(!q){$('list').hidden=true;$('hint').hidden=false;$('hint').textContent='Type a title to find it.';return}
   let r;try{r=await (await fetch('admin/api/search?q='+encodeURIComponent(q))).json()}
   catch(e){status('Search failed. Check your connection and try again.',1);return}
   const l=$('list');l.textContent='';
   l.hidden=!r.items.length;$('hint').hidden=!!r.items.length;
-  $('hint').textContent='Nothing in your library matches "'+q+'".';
+  $('hint').textContent=q?'Nothing in your library matches "'+q+'".':'Your library is empty.';
   r.items.forEach(i=>{
     const d=document.createElement('div');d.className='row';
     const m=document.createElement('div');m.className='meta';
@@ -1365,20 +1367,21 @@ async function search(){
     const b=document.createElement('div');b.className='sub';
     b.textContent=(i.kind==='show'?'Show':'Movie')+' · '+(i.size/2**30).toFixed(1)+' GB';
     m.append(a,b);
-    const x=document.createElement('button');x.className='del';x.textContent='Delete';
+    const x=document.createElement('button');x.className='del';x.innerHTML=TRASH;
     x.setAttribute('aria-label','Delete '+i.title);
     x.onclick=()=>{pending={i,d,x};$('dt').textContent='Delete “'+i.title+'”?';$('dlg').showModal()};
     d.append(m,x);l.append(d)})}
+search();
 $('no').onclick=()=>{pending=null;$('dlg').close()};
 $('dlg').addEventListener('click',e=>{if(e.target===$('dlg'))$('no').click()});
 $('yes').onclick=async()=>{
-  const p=pending;if(!p)return;$('dlg').close();p.x.disabled=true;p.x.textContent='Deleting…';status('');
+  const p=pending;if(!p)return;$('dlg').close();p.x.disabled=true;status('');
   try{
     const x=await (await fetch('admin/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({kind:p.i.kind,id:p.i.id,title:p.i.title})})).json();
-    status(x.message||x.error,!x.message);if(x.message)p.d.remove();else{p.x.disabled=false;p.x.textContent='Delete'}
-    if(!$('list').children.length){$('list').hidden=true;$('hint').hidden=false;$('hint').textContent='Type a title to find it.'}
-  }catch(e){status('Delete failed. Nothing was confirmed removed.',1);p.x.disabled=false;p.x.textContent='Delete'}
+    status(x.message||x.error,!x.message);if(x.message)p.d.remove();else{p.x.disabled=false}
+    if(!$('list').children.length){$('list').hidden=true;$('hint').hidden=false;$('hint').textContent=$('q').value.trim()?'Nothing in your library matches.':'Your library is empty.'}
+  }catch(e){status('Delete failed. Nothing was confirmed removed.',1);p.x.disabled=false}
   pending=null};
 </script>"""
 
@@ -1398,7 +1401,7 @@ def admin_page():
 def admin_search():
     if not admin_allowed():
         return jsonify(error="forbidden"), 403
-    return jsonify(items=find_library(request.args.get("q", ""))[:20])
+    return jsonify(items=find_library(request.args.get("q", ""), allow_all=True))
 
 
 @app.post("/admin/api/delete")
