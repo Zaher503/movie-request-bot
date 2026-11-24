@@ -1,3 +1,4 @@
+import math
 import os
 import requests
 from io import BytesIO
@@ -11,8 +12,11 @@ def build_grid(items: list[dict], out_path: str) -> None:
     tile_h = poster_h + label_h
     
     num_items = len(items)
-    grid_w = (padding * (num_items + 1)) + (tile_w * num_items)
-    grid_h = padding * 2 + tile_h
+    # Squarish layout: 2 -> 2 cols, 3-4 -> 2 cols, 5-9 -> 3 cols
+    cols = max(1, math.ceil(math.sqrt(num_items)))
+    rows = math.ceil(num_items / cols)
+    grid_w = padding * (cols + 1) + tile_w * cols
+    grid_h = padding * (rows + 1) + tile_h * rows
 
     img = Image.new("RGBA", (grid_w, grid_h), "#111")
     draw = ImageDraw.Draw(img)
@@ -32,8 +36,12 @@ def build_grid(items: list[dict], out_path: str) -> None:
         font_tiny_bold = ImageFont.load_default(size=14)
 
     for i, item in enumerate(items):
-        x = padding + i * (tile_w + padding)
-        y = padding
+        row, col = divmod(i, cols)
+        # Center a short last row
+        in_row = min(cols, num_items - row * cols)
+        row_offset = (cols - in_row) * (tile_w + padding) // 2
+        x = padding + row_offset + col * (tile_w + padding)
+        y = padding + row * (tile_h + padding)
         
         poster_img = None
         if item.get("poster_url"):
@@ -133,9 +141,10 @@ def build_grid(items: list[dict], out_path: str) -> None:
     img.convert("RGB").save(out_path, "JPEG", quality=85)
 
 if __name__ == "__main__":
-    fake_items = [
-        {"n": 1, "poster_url": None, "title": "Scream", "year": "1996", "badge": "In Library"},
-        {"n": 2, "poster_url": None, "title": "Scream 2", "year": "1997", "badge": "Requested"},
-        {"n": 3, "poster_url": None, "title": "Scream 3", "year": "2000", "badge": None, "subtitle": "3 seasons"},
-    ]
-    build_grid(fake_items, "sample.jpg")
+    titles = [("Scream", "1996", "In Library"), ("Scream 2", "1997", "Requested"), ("Scream 3", "2000", None),
+              ("Scream 4", "2011", None), ("Scream (2022)", "2022", "In Library"), ("Scream VI", "2023", None)]
+    import sys
+    count = int(sys.argv[1]) if len(sys.argv) > 1 else 5
+    fake_items = [{"n": i + 1, "poster_url": None, "title": titles[i % 6][0], "year": titles[i % 6][1],
+                   "badge": titles[i % 6][2]} for i in range(count)]
+    build_grid(fake_items, f"sample{count}.jpg")
